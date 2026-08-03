@@ -35,7 +35,13 @@ class RotaryEmbedding: Module {
     }
 
     func callAsFunction(_ t: MLXArray) -> (MLXArray, Float) {
-        var freqs = MLX.matmul(t.expandedDimensions(axis: 1).asType(inv_freq.dtype), inv_freq.expandedDimensions(axis: 0))
+        // MLX.matmul takes a reduced-precision GPU path that quantises the position index above
+        // 2048 to a spacing of 2 (2049 -> 2048, 2711 -> 2710), so rope phase drifts by up to 1 rad
+        // and the tail of long sequences degrades. A broadcast multiply in fp32 is exact and matches
+        // f5_tts_mlx's einsum. Positions must stay fp32: an fp16 inv_freq would demote and quantise
+        // them the same way.
+        var freqs = t.expandedDimensions(axis: 1).asType(.float32)
+            * inv_freq.expandedDimensions(axis: 0).asType(.float32)
         freqs = freqs / interpolationFactor
 
         freqs = MLX.stacked([freqs, freqs], axis: -1)
@@ -104,8 +110,10 @@ func applyRotaryPosEmb(t: MLXArray, freqs: MLXArray, scale: Float = 1.0) -> MLXA
 
     let tRotated = t[.ellipsis, 0..<rotDim]
     let tUnrotated = t[.ellipsis, rotDim..<t.shape[t.shape.count - 1]]
-    let rotatedT = (tRotated * freqsRearranged.cos() * scaleAdjusted) +
-        (rotateHalf(tRotated) * freqsRearranged.sin() * scaleAdjusted)
+    // rope phase is fp32 (see RotaryEmbedding); rotate in fp32 and return the input dtype so an
+    // fp16 model keeps its dtype flow downstream
+    let rotatedT = ((tRotated.asType(.float32) * freqsRearranged.cos() * scaleAdjusted) +
+        (rotateHalf(tRotated).asType(.float32) * freqsRearranged.sin() * scaleAdjusted)).asType(t.dtype)
     let out = MLX.concatenated([rotatedT, tUnrotated], axis: -1)
 
     return out
